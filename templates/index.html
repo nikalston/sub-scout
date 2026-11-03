@@ -274,7 +274,7 @@
       </div>
       <div class="stat-card">
         <div class="num" id="stale-count">0</div>
-        <div class="label">Possibly Forgotten</div>
+        <div class="label">Possibly Forgotten (90+ days)</div>
       </div>
       {% endif %}
     </div>
@@ -375,8 +375,12 @@ function renderList(subs) {
     const name = s.sender_name || s.sender_email.split('@')[0];
     const dateStr = lastDate ? lastDate.toLocaleDateString() : 'Unknown';
     const subject = s.subjects && s.subjects[0] ? s.subjects[0] : '';
+    const tagLabels = {
+      'subscription-subject': 'Subject Match',
+      'subscription-body': 'Body Match',
+    };
     const tags = (s.detection_method || []).map(m =>
-      `<span class="tag">${m}</span>`
+      `<span class="tag">${tagLabels[m] || m}</span>`
     ).join('');
 
     return `

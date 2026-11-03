@@ -1,5 +1,7 @@
+import imaplib
 import json
 import re
+import ssl
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from email import message_from_bytes
@@ -7,7 +9,6 @@ from email.header import decode_header
 from email.utils import parseaddr, parsedate_to_datetime
 from pathlib import Path
 
-import imapclient
 from bs4 import BeautifulSoup
 
 import config
@@ -16,11 +17,15 @@ CACHE_FILE = Path(__file__).parent / "scan_results.json"
 
 
 def connect():
+    ctx = ssl.create_default_context()
+    if not config.IMAP_VERIFY_SSL:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
     if config.IMAP_USE_SSL:
-        server = imapclient.IMAPClient(config.IMAP_HOST, port=config.IMAP_PORT, ssl=True)
+        server = imaplib.IMAP4_SSL(config.IMAP_HOST, port=config.IMAP_PORT, ssl_context=ctx)
     else:
-        server = imapclient.IMAPClient(config.IMAP_HOST, port=config.IMAP_PORT, ssl=False)
-        server.starttls()
+        server = imaplib.IMAP4(config.IMAP_HOST, port=config.IMAP_PORT)
+        server.starttls(ssl_context=ctx)
     server.login(config.IMAP_USER, config.IMAP_PASSWORD)
     return server
 
@@ -38,7 +43,38 @@ def decode_header_value(value):
     return " ".join(parts)
 
 
-def extract_unsubscribe_from_body(msg):
+SUBSCRIPTION_SUBJECT_PATTERNS = re.compile(
+    r"(subscription\s+(renew|cancel|expir|confirm|status|will))"
+    r"|(membership\s+(renew|expir|cancel|confirm|auto))"
+    r"|(auto.?renew)"
+    r"|(is\s+renewing)"
+    r"|(will\s+renew)"
+    r"|(about\s+to\s+renew)"
+    r"|(has\s+been\s+renewed)"
+    r"|(free\s+trial\s+(end|expir))"
+    r"|(your\s+receipt\s+from\s+)"
+    r"|(receipt\s+from\s+\S+\s+(for\s+)?\$)"
+    r"|(your\s+invoice\s+(from|for|is))"
+    r"|(invoice\s+is\s+attached)"
+    r"|(billing\s+statement)"
+    r"|(your\s+\S+\s+subscription)"
+    r"|(purchasing\s+a\s+subscription)"
+    r"|(plan\s+is\s+renewing)"
+    r"|(line\s+is\s+about\s+to\s+renew)",
+    re.IGNORECASE,
+)
+
+FOOTER_MARKERS = re.compile(
+    r"(unsubscribe|email\s+preferences|privacy\s+policy|opt.?out"
+    r"|update\s+your\s+preferences|manage\s+your\s+(email|preferences|subscription|communication)"
+    r"|you\s+(are\s+)?receiv(ed|ing)\s+this\s+(email|message|because)"
+    r"|no\s+longer\s+wish\s+to\s+receive"
+    r"|sent\s+(to|by)\s+\S+@)",
+    re.IGNORECASE,
+)
+
+
+def get_body_text(msg):
     body_html = ""
     body_text = ""
 
@@ -67,16 +103,42 @@ def extract_unsubscribe_from_body(msg):
 
     if body_html:
         soup = BeautifulSoup(body_html, "html.parser")
-        for link in soup.find_all("a", href=True):
-            text = link.get_text().lower()
-            href = link["href"].lower()
-            if "unsubscribe" in text or "unsubscribe" in href:
-                return True
+        body_text = soup.get_text(separator=" ", strip=True)
 
-    if body_text and re.search(r"unsubscribe", body_text, re.IGNORECASE):
-        return True
+    return strip_footer(body_text)
 
-    return False
+
+def strip_footer(text):
+    if not text:
+        return text
+    match = FOOTER_MARKERS.search(text)
+    if match:
+        return text[:match.start()]
+    return text
+
+
+IGNORE_SUBJECT_PATTERNS = re.compile(
+    r"(subscribe\s+&\s+save)"
+    r"|(subscription\s+cancelled)"
+    r"|(price\s+alert)"
+    r"|(charge\s+your\s+)"
+    r"|(battery\s+now)"
+    r"|(order\s+(confirm|deliver))"
+    r"|(shipping|shipment|tracking)"
+    r"|(verify|verification\s+code)"
+    r"|(welcome\s+to)"
+    r"|(transmission\s*\|)"
+    r"|(autopay\s+was\s+processed)",
+    re.IGNORECASE,
+)
+
+
+def detect_paid_signals(subject):
+    if IGNORE_SUBJECT_PATTERNS.search(subject):
+        return set()
+    if SUBSCRIPTION_SUBJECT_PATTERNS.search(subject):
+        return {"subscription-subject"}
+    return set()
 
 
 def scan_mailbox(progress_callback=None):
@@ -92,22 +154,34 @@ def scan_mailbox(progress_callback=None):
     })
 
     try:
-        server.select_folder("INBOX", readonly=True)
+        server.select("INBOX", readonly=True)
         since_date = datetime.now(timezone.utc) - timedelta(days=config.SCAN_DAYS)
-        message_ids = server.search(["SINCE", since_date.date()])
+        date_str = since_date.strftime("%d-%b-%Y")
+        _status, data = server.search(None, f'(SINCE {date_str})')
+        message_ids = data[0].split() if data[0] else []
         total = len(message_ids)
 
         if progress_callback:
-            progress_callback(0, total, "Fetching headers...")
+            progress_callback(0, total, "Fetching emails...")
 
-        batch_size = 100
+        batch_size = 50
         for i in range(0, total, batch_size):
             batch = message_ids[i:i + batch_size]
-            fetched = server.fetch(batch, ["BODY.PEEK[HEADER]", "BODY.PEEK[TEXT]"])
+            batch_str = b",".join(batch).decode()
 
-            for msg_id, data in fetched.items():
-                header_data = data.get(b"BODY[HEADER]", b"")
-                msg = message_from_bytes(header_data)
+            _status, header_data = server.fetch(batch_str, "(BODY.PEEK[HEADER])")
+
+            headers_by_id = {}
+            for j in range(0, len(header_data), 2):
+                if header_data[j] is None:
+                    continue
+                if isinstance(header_data[j], tuple):
+                    meta, payload = header_data[j]
+                    msg_num = meta.split()[0]
+                    headers_by_id[msg_num] = payload
+
+            for msg_num, raw_header in headers_by_id.items():
+                msg = message_from_bytes(raw_header)
 
                 from_header = decode_header_value(msg.get("From", ""))
                 sender_name, sender_email = parseaddr(from_header)
@@ -116,21 +190,23 @@ def scan_mailbox(progress_callback=None):
                 if not sender_email:
                     continue
 
-                date_str = msg.get("Date")
+                msg_date_str = msg.get("Date")
                 try:
-                    msg_date = parsedate_to_datetime(date_str) if date_str else None
+                    msg_date = parsedate_to_datetime(msg_date_str) if msg_date_str else None
                 except Exception:
                     msg_date = None
 
                 subject = decode_header_value(msg.get("Subject", ""))
 
-                has_list_unsub = msg.get("List-Unsubscribe") is not None
-                has_list_id = msg.get("List-Id") is not None
+                signals = detect_paid_signals(subject)
+                if not signals:
+                    continue
 
                 entry = results[sender_email]
                 entry["sender_name"] = sender_name or entry["sender_name"]
                 entry["sender_email"] = sender_email
                 entry["count"] += 1
+                entry["detection_method"].update(signals)
 
                 if msg_date:
                     date_iso = msg_date.isoformat()
@@ -139,21 +215,8 @@ def scan_mailbox(progress_callback=None):
                     if entry["last_seen"] is None or date_iso > entry["last_seen"]:
                         entry["last_seen"] = date_iso
 
-                if subject and len(entry["subjects"]) < 3:
+                if subject and len(entry["subjects"]) < 5:
                     entry["subjects"].append(subject)
-
-                if has_list_unsub:
-                    entry["detection_method"].add("list-unsubscribe-header")
-                if has_list_id:
-                    entry["detection_method"].add("list-id-header")
-
-                if not has_list_unsub and not has_list_id:
-                    body_data = data.get(b"BODY[TEXT]", b"")
-                    if body_data:
-                        full_raw = header_data + b"\r\n" + body_data
-                        full_msg = message_from_bytes(full_raw)
-                        if extract_unsubscribe_from_body(full_msg):
-                            entry["detection_method"].add("body-unsubscribe-link")
 
             if progress_callback:
                 progress_callback(min(i + batch_size, total), total, "Scanning...")
@@ -161,10 +224,29 @@ def scan_mailbox(progress_callback=None):
     finally:
         server.logout()
 
-    subscriptions = []
+    merged = {}
     for email_addr, info in results.items():
         if not info["detection_method"]:
             continue
+        domain = email_addr.split("@")[-1]
+        base_domain = ".".join(domain.split(".")[-2:])
+        if base_domain in merged:
+            existing = merged[base_domain]
+            existing["count"] += info["count"]
+            existing["detection_method"].update(info["detection_method"])
+            if info["first_seen"] and (not existing["first_seen"] or info["first_seen"] < existing["first_seen"]):
+                existing["first_seen"] = info["first_seen"]
+            if info["last_seen"] and (not existing["last_seen"] or info["last_seen"] > existing["last_seen"]):
+                existing["last_seen"] = info["last_seen"]
+            for subj in info["subjects"]:
+                if subj not in existing["subjects"] and len(existing["subjects"]) < 5:
+                    existing["subjects"].append(subj)
+            existing["sender_name"] = existing["sender_name"] or info["sender_name"]
+        else:
+            merged[base_domain] = info
+
+    subscriptions = []
+    for info in merged.values():
         info["detection_method"] = list(info["detection_method"])
         subscriptions.append(info)
 
